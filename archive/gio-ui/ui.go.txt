@@ -1,0 +1,684 @@
+// Package ui contains the virtual Gio presentation for STEPView.
+package ui
+
+import (
+	"fmt"
+	"image/color"
+	"io"
+	"strings"
+	"unsafe"
+
+	"gioui.org/io/clipboard"
+	"gioui.org/io/pointer"
+	"gioui.org/layout"
+	"gioui.org/op/clip"
+	"gioui.org/op/paint"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
+
+	"stepview/internal/document"
+	"stepview/internal/index"
+	"stepview/internal/search"
+	"stepview/internal/step"
+)
+
+var (
+	background = color.NRGBA{R: 18, G: 18, B: 17, A: 255}
+	panel      = color.NRGBA{R: 27, G: 27, B: 25, A: 255}
+	panelAlt   = color.NRGBA{R: 34, G: 34, B: 31, A: 255}
+	muted      = color.NRGBA{R: 161, G: 160, B: 151, A: 255}
+	cyan       = color.NRGBA{R: 83, G: 182, B: 232, A: 255}
+	gold       = color.NRGBA{R: 255, G: 177, B: 55, A: 255}
+	green      = color.NRGBA{R: 122, G: 218, B: 157, A: 255}
+	magenta    = color.NRGBA{R: 255, G: 177, B: 55, A: 255}
+	white      = color.NRGBA{R: 245, G: 242, B: 234, A: 255}
+)
+
+// App retains every stateful Gio widget for the lifetime of a loaded document.
+type App struct {
+	theme *material.Theme
+
+	doc     document.Document
+	builder *index.Builder
+	search  *search.Service
+	name    string
+
+	navigatorList widget.List
+	viewerList    widget.List
+	viewerHList   widget.List
+	inspectorList widget.List
+	searchEditor  widget.Editor
+	filterEditor  widget.Editor
+
+	searchButton  widget.Clickable
+	loadButton    widget.Clickable
+	sampleButton  widget.Clickable
+	allButton     widget.Clickable
+	copyButton    widget.Clickable
+	refButton     widget.Clickable
+	backButton    widget.Clickable
+	forwardButton widget.Clickable
+	fileMenu      widget.Clickable
+	viewMenu      widget.Clickable
+	settingsMenu  widget.Clickable
+
+	typeButtons map[string]*widget.Clickable
+	lineButtons map[uint64]*widget.Clickable
+	refButtons  map[uint64]*widget.Clickable
+
+	types          []index.TypeEntry
+	activeLines    []uint64
+	referrerLines  []uint64
+	selectedLine   uint64
+	hasSelection   bool
+	history        []uint64
+	historyForward []uint64
+	spans          []step.Span
+	children       []layout.FlexChild
+	status         string
+	activeMenu     menu
+}
+
+type menu uint8
+
+const (
+	noMenu menu = iota
+	fileMenu
+	viewMenu
+	settingsMenu
+)
+
+// New creates an app over doc. The caller retains responsibility for Close.
+func New(doc document.Document, name string) *App {
+	theme := material.NewTheme()
+	theme.Palette.Bg = background
+	theme.Palette.Fg = white
+	theme.Palette.ContrastBg = gold
+	theme.Palette.ContrastFg = background
+	theme.Face = "JetBrains Mono"
+	theme.TextSize = unit.Sp(13)
+	theme.FingerSize = unit.Dp(28)
+	a := &App{
+		theme:       theme,
+		doc:         doc,
+		name:        name,
+		typeButtons: make(map[string]*widget.Clickable),
+		lineButtons: make(map[uint64]*widget.Clickable),
+		refButtons:  make(map[uint64]*widget.Clickable),
+		spans:       make([]step.Span, 0, 32),
+		children:    make([]layout.FlexChild, 0, 65),
+	}
+	a.navigatorList.Axis = layout.Vertical
+	a.viewerList.Axis = layout.Vertical
+	a.viewerHList.Axis = layout.Horizontal
+	a.inspectorList.Axis = layout.Vertical
+	a.searchEditor.SingleLine = true
+	a.searchEditor.Submit = true
+	a.filterEditor.SingleLine = true
+	a.setDocument(doc, name)
+	return a
+}
+
+// Load replaces the active document and resets all index-dependent UI state.
+func (a *App) Load(doc document.Document, name string) {
+	if a.doc != nil && a.doc != doc {
+		_ = a.doc.Close()
+	}
+	a.setDocument(doc, name)
+}
+
+func (a *App) setDocument(doc document.Document, name string) {
+	a.doc = doc
+	a.name = name
+	a.builder = index.NewBuilder(doc)
+	a.search = search.New(doc, a.builder)
+	a.types = nil
+	a.activeLines = nil
+	a.referrerLines = nil
+	a.hasSelection = false
+	a.history = nil
+	a.historyForward = nil
+	a.status = ""
+	a.viewerList.Position = layout.Position{}
+}
+
+// Layout renders only the rows visible to the three virtual lists.
+func (a *App) Layout(gtx layout.Context) layout.Dimensions {
+	a.handleEvents(gtx)
+	a.refreshTypes()
+	pointer.CursorDefault.Add(gtx.Ops)
+	paint.Fill(gtx.Ops, background)
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(a.layoutMenuBar),
+		layout.Rigid(a.layoutTopBar),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return a.layoutContent(gtx)
+		}),
+	)
+}
+
+func (a *App) layoutContent(gtx layout.Context) layout.Dimensions {
+	minViewer := gtx.Dp(360)
+	navWidth := gtx.Dp(250)
+	inspectorWidth := gtx.Dp(330)
+	available := gtx.Constraints.Max.X
+	if available < navWidth+inspectorWidth+minViewer {
+		navWidth = minInt(gtx.Dp(210), available/4)
+		inspectorWidth = minInt(gtx.Dp(280), available/3)
+	}
+	if available < navWidth+inspectorWidth+gtx.Dp(240) {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Max.Y = gtx.Dp(170)
+				return a.panel(gtx, panel, a.layoutNavigator)
+			}),
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return a.panel(gtx, panelAlt, a.layoutViewer)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Max.Y = gtx.Dp(220)
+				return a.panel(gtx, panel, a.layoutInspector)
+			}),
+		)
+	}
+	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Max.X = navWidth
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return a.panel(gtx, panel, a.layoutNavigator)
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return a.panel(gtx, panelAlt, a.layoutViewer)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Max.X = inspectorWidth
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return a.panel(gtx, panel, a.layoutInspector)
+		}),
+	)
+}
+
+func (a *App) panel(gtx layout.Context, fill color.NRGBA, content layout.Widget) layout.Dimensions {
+	stack := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	paint.Fill(gtx.Ops, fill)
+	stack.Pop()
+	return layout.UniformInset(unit.Dp(10)).Layout(gtx, content)
+}
+
+func (a *App) handleEvents(gtx layout.Context) {
+	for a.searchButton.Clicked(gtx) {
+		a.performSearch()
+	}
+	for {
+		event, ok := a.searchEditor.Update(gtx)
+		if !ok {
+			break
+		}
+		if _, ok := event.(widget.SubmitEvent); ok {
+			a.performSearch()
+		}
+	}
+	for a.allButton.Clicked(gtx) {
+		a.activeLines = nil
+		a.viewerList.Position = layout.Position{}
+	}
+	for a.sampleButton.Clicked(gtx) {
+		a.Load(SampleDocument(), "stepview-demo.ifc")
+	}
+	for a.loadButton.Clicked(gtx) {
+		path, err := SelectIFCFile()
+		if err != nil {
+			a.status = err.Error()
+			continue
+		}
+		if path == "" {
+			a.status = "Dateiauswahl abgebrochen"
+			continue
+		}
+		doc, err := document.Open(path)
+		if err != nil {
+			a.status = err.Error()
+			continue
+		}
+		a.Load(doc, path)
+	}
+	for a.copyButton.Clicked(gtx) {
+		if a.hasSelection {
+			start, end := a.builder.Lines().Bounds(a.selectedLine, a.doc.Len())
+			text := string(a.doc.Slice(start, end))
+			gtx.Execute(clipboard.WriteCmd{Type: "text/plain", Data: io.NopCloser(strings.NewReader(text))})
+		}
+	}
+	for a.refButton.Clicked(gtx) {
+		if a.hasSelection {
+			var parsed step.ParsedEntity
+			start, end := a.builder.Lines().Bounds(a.selectedLine, a.doc.Len())
+			if entity, _ := step.ParseLine(a.doc.Slice(start, end), &parsed, nil); entity {
+				a.referrerLines = a.search.FindReferrers(parsed.ID, 200)
+			}
+		}
+	}
+	for a.backButton.Clicked(gtx) {
+		if len(a.history) == 0 {
+			continue
+		}
+		previous := a.history[len(a.history)-1]
+		a.history = a.history[:len(a.history)-1]
+		if a.hasSelection {
+			a.historyForward = append(a.historyForward, a.selectedLine)
+		}
+		a.selectLine(previous, false)
+	}
+	for a.forwardButton.Clicked(gtx) {
+		if len(a.historyForward) == 0 {
+			continue
+		}
+		next := a.historyForward[len(a.historyForward)-1]
+		a.historyForward = a.historyForward[:len(a.historyForward)-1]
+		if a.hasSelection {
+			a.history = append(a.history, a.selectedLine)
+		}
+		a.selectLine(next, false)
+	}
+	a.toggleMenu(gtx, &a.fileMenu, fileMenu)
+	a.toggleMenu(gtx, &a.viewMenu, viewMenu)
+	a.toggleMenu(gtx, &a.settingsMenu, settingsMenu)
+	for name, button := range a.typeButtons {
+		for button.Clicked(gtx) {
+			for _, entry := range a.types {
+				if entry.Name == name {
+					a.activeLines = entry.Lines
+					a.viewerList.Position = layout.Position{}
+					break
+				}
+			}
+		}
+	}
+	for line, button := range a.lineButtons {
+		for button.Clicked(gtx) {
+			a.selectLine(line, true)
+		}
+	}
+	for line, button := range a.refButtons {
+		for button.Clicked(gtx) {
+			a.selectLine(line, true)
+		}
+	}
+}
+
+func (a *App) refreshTypes() {
+	if a.builder.IsReady() {
+		a.types = a.builder.Types().Entries()
+	}
+}
+
+func (a *App) performSearch() {
+	results := a.search.Search(a.searchEditor.Text(), 10_000)
+	a.activeLines = results
+	if len(results) > 0 {
+		a.selectLine(results[0], true)
+	} else {
+		a.status = "Keine Treffer"
+	}
+}
+
+func (a *App) selectLine(line uint64, recordHistory bool) {
+	if recordHistory && a.hasSelection && a.selectedLine != line {
+		a.history = append(a.history, a.selectedLine)
+		a.historyForward = nil
+	}
+	a.selectedLine = line
+	a.hasSelection = true
+	for i, candidate := range a.visibleLines() {
+		if candidate == line {
+			a.viewerList.Position.First = i
+			a.viewerList.Position.Offset = 0
+			return
+		}
+	}
+}
+
+func (a *App) visibleLines() []uint64 {
+	if a.activeLines != nil {
+		return a.activeLines
+	}
+	// This view is implicit to avoid allocating a []uint64 for every line.
+	return nil
+}
+
+func (a *App) toggleMenu(gtx layout.Context, button *widget.Clickable, selected menu) {
+	for button.Clicked(gtx) {
+		if a.activeMenu == selected {
+			a.activeMenu = noMenu
+		} else {
+			a.activeMenu = selected
+		}
+	}
+}
+
+func (a *App) layoutMenuBar(gtx layout.Context) layout.Dimensions {
+	return layout.Inset{Left: unit.Dp(12), Right: unit.Dp(12), Top: unit.Dp(6), Bottom: unit.Dp(3)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Label(a.theme, unit.Sp(18), "STEP//VIEW")
+				label.Color = cyan
+				return label.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.UniformInset(unit.Dp(12)).Layout(gtx, compactButton(a.theme, &a.fileMenu, "Datei").Layout)
+			}),
+			layout.Rigid(compactButton(a.theme, &a.viewMenu, "Ansicht").Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.UniformInset(unit.Dp(6)).Layout(gtx, compactButton(a.theme, &a.settingsMenu, "Einstellungen").Layout)
+			}),
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				if a.status == "" {
+					return layout.Dimensions{}
+				}
+				label := material.Caption(a.theme, a.status)
+				label.Color = magenta
+				return label.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				label := material.Caption(a.theme, "READ ONLY // IFC-SPF")
+				label.Color = green
+				return label.Layout(gtx)
+			}),
+		)
+	})
+}
+
+func (a *App) layoutTopBar(gtx layout.Context) layout.Dimensions {
+	progress := a.builder.Progress()
+	info := fmt.Sprintf("%s | %d Bytes | Indiziert: %.0f%% | %d Zeilen", a.name, a.doc.Len(), progress*100, a.builder.IndexedLines())
+	return a.panel(gtx, panelAlt, func(gtx layout.Context) layout.Dimensions {
+		if a.activeMenu == noMenu {
+			return a.layoutToolbar(gtx, info)
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return a.layoutToolbar(gtx, info)
+			}),
+			layout.Rigid(a.layoutMenuContents),
+		)
+	})
+}
+
+func (a *App) layoutToolbar(gtx layout.Context, info string) layout.Dimensions {
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			label := material.Caption(a.theme, info)
+			label.Color = muted
+			return label.Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(6)).Layout(gtx, compactButton(a.theme, &a.loadButton, "Datei öffnen").Layout)
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				editor := material.Editor(a.theme, &a.searchEditor, "#ID, GlobalId oder Volltext")
+				editor.Color = white
+				return editor.Layout(gtx)
+			})
+		}),
+		layout.Rigid(compactButton(a.theme, &a.searchButton, "Suchen").Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(6)).Layout(gtx, compactButton(a.theme, &a.sampleButton, "Demo").Layout)
+		}),
+	)
+}
+
+func (a *App) layoutMenuContents(gtx layout.Context) layout.Dimensions {
+	var content string
+	switch a.activeMenu {
+	case fileMenu:
+		content = "Datei: IFC-Pfad eingeben und Öffnen wählen, oder die integrierte Demo mit Sample laden."
+	case viewMenu:
+		content = "Ansicht: IFC-Typen filtern, Alle Zeilen anzeigen oder #Entity-ID direkt suchen."
+	case settingsMenu:
+		content = "Einstellungen: Cyberpunk-Dunkelmodus aktiv. Native KDE-Fensterdekoration ist aktiviert."
+	default:
+		return layout.Dimensions{}
+	}
+	label := material.Body2(a.theme, content)
+	label.Color = muted
+	return layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(4)}.Layout(gtx, label.Layout)
+}
+
+func (a *App) layoutNavigator(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(material.Label(a.theme, unit.Sp(14), "IFC-Typen").Layout),
+		layout.Rigid(material.Editor(a.theme, &a.filterEditor, "Filter").Layout),
+		layout.Rigid(compactButton(a.theme, &a.allButton, "Alle Zeilen").Layout),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			filter := strings.ToLower(a.filterEditor.Text())
+			filtered := a.types[:0]
+			for _, entry := range a.types {
+				if filter == "" || strings.Contains(strings.ToLower(entry.Name), filter) {
+					filtered = append(filtered, entry)
+				}
+			}
+			return scrollList(a.theme, &a.navigatorList).Layout(gtx, len(filtered), func(gtx layout.Context, position int) layout.Dimensions {
+				entry := filtered[position]
+				button := a.typeButtons[entry.Name]
+				if button == nil {
+					button = new(widget.Clickable)
+					a.typeButtons[entry.Name] = button
+				}
+				return compactButton(a.theme, button, fmt.Sprintf("%s (%d)", entry.Name, entry.Count)).Layout(gtx)
+			})
+		}),
+	)
+}
+
+func (a *App) layoutViewer(gtx layout.Context) layout.Dimensions {
+	count := int(a.builder.Lines().Len())
+	if a.activeLines != nil {
+		count = len(a.activeLines)
+	}
+	return scrollList(a.theme, &a.viewerHList).Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
+		contentWidth := maxInt(gtx.Dp(4096), gtx.Constraints.Max.X)
+		gtx.Constraints.Min.X = contentWidth
+		gtx.Constraints.Max.X = contentWidth
+		return scrollList(a.theme, &a.viewerList).Layout(gtx, count, func(gtx layout.Context, position int) layout.Dimensions {
+			line := uint64(position)
+			if a.activeLines != nil {
+				line = a.activeLines[position]
+			}
+			button := a.lineButtons[line]
+			if button == nil {
+				button = new(widget.Clickable)
+				a.lineButtons[line] = button
+			}
+			return material.Clickable(gtx, button, func(gtx layout.Context) layout.Dimensions {
+				start, end := a.builder.Lines().Bounds(line, a.doc.Len())
+				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						var digits [20]byte
+						number := appendLineNumber(digits[:0], line+1)
+						label := material.Label(a.theme, unit.Sp(11), unsafe.String(unsafe.SliceData(number), len(number)))
+						label.Color = muted
+						return layout.UniformInset(unit.Dp(4)).Layout(gtx, label.Layout)
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return a.layoutSyntaxLine(gtx, a.doc.Slice(start, end))
+					}),
+				)
+			})
+		})
+	})
+}
+
+func (a *App) layoutSyntaxLine(gtx layout.Context, line []byte) layout.Dimensions {
+	a.spans = step.TokenSpans(line, a.spans)
+	children := a.children[:0]
+	cursor := 0
+	for _, span := range a.spans {
+		if int(span.Start) > cursor {
+			children = append(children, syntaxLabel(a.theme, line[cursor:span.Start], white))
+		}
+		children = append(children, syntaxLabel(a.theme, line[span.Start:span.End], spanColor(span.Kind)))
+		cursor = int(span.End)
+	}
+	if cursor < len(line) {
+		children = append(children, syntaxLabel(a.theme, line[cursor:], white))
+	}
+	a.children = children
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Baseline}.Layout(gtx, children...)
+}
+
+func syntaxLabel(theme *material.Theme, bytes []byte, color color.NRGBA) layout.FlexChild {
+	text := unsafe.String(unsafe.SliceData(bytes), len(bytes))
+	return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		label := material.Label(theme, unit.Sp(11), text)
+		label.Color = color
+		label.MaxLines = 1
+		label.Truncator = "\u200b"
+		return label.Layout(gtx)
+	})
+}
+
+func spanColor(kind step.SpanKind) color.NRGBA {
+	switch kind {
+	case step.SpanID, step.SpanReference:
+		return cyan
+	case step.SpanType, step.SpanKeyword:
+		return gold
+	case step.SpanString:
+		return green
+	default:
+		return white
+	}
+}
+
+func (a *App) layoutInspector(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(material.Label(a.theme, unit.Sp(14), "Inspector").Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if !a.hasSelection {
+				label := material.Body2(a.theme, "Zeile auswählen")
+				label.Color = muted
+				return label.Layout(gtx)
+			}
+			start, end := a.builder.Lines().Bounds(a.selectedLine, a.doc.Len())
+			var parsed step.ParsedEntity
+			if entity, refs := step.ParseLine(a.doc.Slice(start, end), &parsed, make([]uint64, 0, 16)); entity {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					layout.Rigid(material.Body1(a.theme, fmt.Sprintf("#%d %s", parsed.ID, parsed.Type)).Layout),
+					layout.Rigid(material.Body2(a.theme, "GlobalId: "+parsed.GlobalID).Layout),
+					layout.Rigid(compactButton(a.theme, &a.copyButton, "Zeile kopieren").Layout),
+					layout.Rigid(compactButton(a.theme, &a.refButton, "Referenzen suchen").Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+							layout.Rigid(compactButton(a.theme, &a.backButton, "Zurück").Layout),
+							layout.Rigid(compactButton(a.theme, &a.forwardButton, "Vor").Layout),
+						)
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return a.layoutReferences(gtx, refs)
+					}),
+				)
+			}
+			return material.Body2(a.theme, "Keine IFC-Entity").Layout(gtx)
+		}),
+		layout.Flexed(1, a.layoutReferrers),
+	)
+}
+
+func (a *App) layoutReferences(gtx layout.Context, refs []uint64) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, layout.Rigid(material.Caption(a.theme, "Ausgehend").Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, referenceChildren(a, refs)...)
+		}))
+}
+
+func referenceChildren(a *App, refs []uint64) []layout.FlexChild {
+	children := make([]layout.FlexChild, 0, len(refs))
+	for _, id := range refs {
+		line, found := a.search.JumpToEntity(id)
+		if !found {
+			continue
+		}
+		button := a.refButtons[line]
+		if button == nil {
+			button = new(widget.Clickable)
+			a.refButtons[line] = button
+		}
+		start, end := a.builder.Lines().Bounds(line, a.doc.Len())
+		var target step.ParsedEntity
+		step.ParseLine(a.doc.Slice(start, end), &target, nil)
+		text := fmt.Sprintf("#%d -> %s", id, target.Type)
+		children = append(children, layout.Rigid(compactButton(a.theme, button, text).Layout))
+	}
+	return children
+}
+
+func (a *App) layoutReferrers(gtx layout.Context) layout.Dimensions {
+	return scrollList(a.theme, &a.inspectorList).Layout(gtx, len(a.referrerLines), func(gtx layout.Context, position int) layout.Dimensions {
+		line := a.referrerLines[position]
+		button := a.refButtons[line]
+		if button == nil {
+			button = new(widget.Clickable)
+			a.refButtons[line] = button
+		}
+		return compactButton(a.theme, button, fmt.Sprintf("Zeile %d", line+1)).Layout(gtx)
+	})
+}
+
+func appendLineNumber(dst []byte, value uint64) []byte {
+	var reverse [20]byte
+	count := 1
+	reverse[0] = byte(value%10) + '0'
+	for value /= 10; value > 0; value /= 10 {
+		reverse[count] = byte(value%10) + '0'
+		count++
+	}
+	for count > 0 {
+		count--
+		dst = append(dst, reverse[count])
+	}
+	return dst
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func compactButton(theme *material.Theme, button *widget.Clickable, text string) material.ButtonStyle {
+	style := material.Button(theme, button, text)
+	style.Background = panelAlt
+	style.Color = white
+	style.TextSize = unit.Sp(11)
+	style.CornerRadius = 0
+	style.Inset = layout.Inset{
+		Top:    unit.Dp(6),
+		Bottom: unit.Dp(6),
+		Left:   unit.Dp(9),
+		Right:  unit.Dp(9),
+	}
+	return style
+}
+
+func scrollList(theme *material.Theme, list *widget.List) material.ListStyle {
+	style := material.List(theme, list)
+	style.Track.Color = color.NRGBA{R: 52, G: 51, B: 47, A: 255}
+	style.Track.MajorPadding = unit.Dp(2)
+	style.Track.MinorPadding = unit.Dp(1)
+	style.Indicator.Color = gold
+	style.Indicator.HoverColor = cyan
+	style.Indicator.MinorWidth = unit.Dp(5)
+	style.Indicator.MajorMinLen = unit.Dp(48)
+	style.Indicator.CornerRadius = 0
+	return style
+}

@@ -1,0 +1,43 @@
+package ui
+
+import "stepview/internal/document"
+
+// SampleDocument supplies a small linked IFC model when no file is available.
+func SampleDocument() document.Document {
+	return document.NewMemoryDocument([]byte(sampleIFC))
+}
+
+const sampleIFC = `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('stepview-demo.ifc','2026-01-01T00:00:00',(),(), 'STEPView','STEPView','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPERSON($,'Doe','Jane',$,$,$,$,$);
+#2=IFCORGANIZATION($,'STEPView',$,$,$);
+#3=IFCPERSONANDORGANIZATION(#1,#2,$);
+#4=IFCAPPLICATION(#2,'1.0','STEPView','STEPVIEW');
+#5=IFCOWNERHISTORY(#3,#4,$,.ADDED.,$,$,$,0);
+#10=IFCUNITASSIGNMENT(());
+#11=IFCPROJECT('0J$DemoProject1234567890',$,'STEPView Demo',$,$,$,$,(#10));
+#12=IFCSITE('1SiteDemo123456789012',$,'Demo Site',$,$,$,$,$,$,$,$,$,$,$);
+#13=IFCBUILDING('1BuildingDemo123456789',$,'Demo Building',$,$,$,$,$,$,$,$,$);
+#14=IFCBUILDINGSTOREY('1StoreyDemo1234567890',$,'Ground Floor',$,$,$,$,$,$,0.);
+#20=IFCLOCALPLACEMENT($,$);
+#21=IFCLOCALPLACEMENT(#20,$);
+#22=IFCLOCALPLACEMENT(#21,$);
+#30=IFCWALL('2WallDemo000000000001',$,'External Wall A',$,$,#22,$,$,.NOTDEFINED.);
+#31=IFCWALL('2WallDemo000000000002',$,'Innenwand',$,$,#22,$,$,.NOTDEFINED.);
+#32=IFCWALL('2WallDemo000000000003',$,'External Wall B',$,$,#22,$,$,.NOTDEFINED.);
+#40=IFCPROPERTYSET('3PsetDemo000000000001',$,'Pset_WallCommon',$,(#41,#42));
+#41=IFCPROPERTYSINGLEVALUE('Reference',$,IFCLABEL('WALL-A'),$);
+#42=IFCPROPERTYSINGLEVALUE('IsExternal',$,IFCBOOLEAN(.T.),$);
+#50=IFCRELAGGREGATES('4RelDemo0000000000001',$,$,$,#11,(#12));
+#51=IFCRELAGGREGATES('4RelDemo0000000000002',$,$,$,#12,(#13));
+#52=IFCRELAGGREGATES('4RelDemo0000000000003',$,$,$,#13,(#14));
+#53=IFCRELCONTAINEDINSPATIALSTRUCTURE('4RelDemo0000000000004',$,$,$,(#30,#31,#32),#14);
+#54=IFCRELDEFINESBYPROPERTIES('4RelDemo0000000000005',$,$,$,(#30,#31,#32),#40);
+ENDSEC;
+END-ISO-10303-21;
+`
