@@ -8,10 +8,9 @@
     <img src="https://img.shields.io/badge/Backend-Go-00ADD8?style=flat&logo=go&logoColor=white" alt="Go">
     <img src="https://img.shields.io/badge/UI-Fyne-4f46e5?style=flat" alt="Fyne">
     <img src="https://img.shields.io/badge/Platform-Windows%2011%20%7C%20Linux-lightblue?style=flat&logo=linux" alt="Platform">
-    <img src="https://github.com/dwellermann/IFC-Editor/actions/workflows/ci.yml/badge.svg" alt="CI">
+    <img src="https://github.com/dwellermann/IFC-Raw-Viewer/actions/workflows/ci.yml/badge.svg" alt="CI">
   </p>
 </div>
-
 ---
 
 > 🇩🇪 **Hinweis:** Oberfläche und Quellcode sind englisch. Diese README sowie
